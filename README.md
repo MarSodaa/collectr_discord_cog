@@ -728,14 +728,6 @@ The current one-request-at-a-time system is a conservative starting point, but t
 
 ---
 
-## 6. Verify Collection Semantics
-
-The proof of concept assumes that a missing card means it has been removed from the user's collection.
-
-The production implementation should verify that this interpretation matches Collectr's actual collection API behavior.
-
----
-
 # Project Architecture
 
 The cog is intentionally divided into several logical layers.
