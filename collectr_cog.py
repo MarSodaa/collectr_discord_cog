@@ -60,10 +60,6 @@ COMMON_TIMEZONES = [
 
 # =============================================================================
 # COLLECTR API CLIENT
-# (Written optimistically -- assumes a REST endpoint shaped like this exists.
-#  Adjust base_url / auth / JSON shape once real docs are available; nothing
-#  else in this file needs to change as long as get_collection() still
-#  returns a list[CollectrCard].)
 # =============================================================================
 
 @dataclass
@@ -75,16 +71,6 @@ class CollectrCard:
 
 
 class CollectrClient:
-    """
-    All outbound requests funnel through a single-slot (width-1) semaphore,
-    so at most one Collectr API call is ever in flight process-wide -- this
-    protects against multiple servers/channels becoming "due" at the same
-    instant and firing concurrent requests. The stagger sleep is inside a
-    `finally`, so it runs even when the request raises; that's what stops a
-    caller's retry/for-loop from immediately re-hitting the API after an
-    error with no delay.
-    """
-
     def __init__(self, api_key: str = COLLECTR_API_KEY, base_url: str = COLLECTR_API_BASE_URL):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
@@ -108,17 +94,6 @@ class CollectrClient:
                 await asyncio.sleep(API_REQUEST_STAGGER_SECONDS)
 
     async def _fetch_collection(self, collectr_id: str) -> list[CollectrCard]:
-        """
-        GET /users/{collectr_id}/collection
-
-        Assumed response shape:
-        {
-          "cards": [
-            {"id": "abc123", "title": "Charizard VMAX", "market_value": 120.50, "market_movement": 4.25},
-            ...
-          ]
-        }
-        """
         url = f"{self.base_url}/users/{collectr_id}/collection"
         async with self._session.get(url) as resp:
             resp.raise_for_status()
@@ -230,8 +205,6 @@ async def remove_user(db, server_id, discord_id):
     await db.execute("DELETE FROM users WHERE server_id=? AND discord_id=?", (server_id, discord_id))
     await db.commit()
     if user:
-        # only drop cached collection rows if no other tracked entry (any
-        # server) still references this collectr_id
         async with db.execute(
             "SELECT COUNT(*) FROM users WHERE collectr_id=?", (user.collectr_id,)
         ) as cur:
@@ -347,7 +320,6 @@ async def process_user_update(client: CollectrClient, db, user: UserRow) -> dict
     new_cards = []
     moved_cards = []
 
-    # 1. New cards: present live, not in stored
     for card_id, card in live_by_id.items():
         if card_id not in stored_by_id:
             new_cards.append({"card_id": card_id, "title": card.title})
@@ -357,7 +329,6 @@ async def process_user_update(client: CollectrClient, db, user: UserRow) -> dict
                 (user.collectr_id, card_id, card.title, card.market_movement),
             )
 
-    # 2. Missing cards: present in stored, gone from live -> delete
     for card_id in stored_by_id:
         if card_id not in live_by_id:
             await db.execute(
@@ -365,10 +336,9 @@ async def process_user_update(client: CollectrClient, db, user: UserRow) -> dict
                 (user.collectr_id, card_id),
             )
 
-    # 3. Market movement: changed since last check AND >= user's threshold
     for card_id, card in live_by_id.items():
         if card_id not in stored_by_id:
-            continue  # already reported as new, don't double-notify
+            continue
         old_movement = stored_by_id[card_id]["market_movement"]
         if card.market_movement != old_movement and abs(card.market_movement) >= user.threshold:
             moved_cards.append({
@@ -416,9 +386,6 @@ def format_update_message(user: UserRow, diff: dict) -> Optional[str]:
 
 
 def build_min_gap_warning(times, internal_freq_hours: int) -> Optional[str]:
-    """
-    Non-blocking, informational only if the update time interval < api call interval
-    """
     if len(times) < 2:
         return None
 
@@ -473,8 +440,6 @@ class TrackedUserSelect(discord.ui.Select):
 
 
 class UserPickerSelect(discord.ui.UserSelect):
-    """Mod-only picker for choosing *which* member to add tracking for."""
-
     def __init__(self, db, server_id: int, management_view: "UserManagementView"):
         super().__init__(placeholder="Choose a member to track...")
         self.db = db
@@ -807,7 +772,7 @@ class UpdateTimeView(discord.ui.View):
         self.add_item(self.save_button)
 
         self.custom_time_button = discord.ui.Button(
-            label="Custom Time (mods)", style=discord.ButtonStyle.secondary, row=3
+            label="Custom Time", style=discord.ButtonStyle.secondary, row=3
         )
         self.custom_time_button.callback = self.on_custom_time
         self.add_item(self.custom_time_button)
@@ -847,9 +812,6 @@ class UpdateTimeView(discord.ui.View):
         await self.refresh(interaction)
 
     async def on_custom_time(self, interaction: discord.Interaction):
-        if not is_mod(interaction.user):
-            await interaction.response.send_message("Only mods can set a custom time.", ephemeral=True)
-            return
         await interaction.response.send_modal(
             CustomTimeModal(self.db, self.server_id, self.channel_id, self.selected_timezone or "UTC", self)
         )
@@ -954,23 +916,32 @@ class CollectrCog(commands.Cog):
         view = UserManagementView(self.db, interaction.guild_id, interaction.user, users)
         await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
-    @app_commands.command(name="collectr-config", description="Configure Collectr update channels and times")
+    @app_commands.command(name="collectr-config", description="Configure or view Collectr update channels and times")
     @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
     async def collectr_config_cmd(self, interaction: discord.Interaction):
-        channel_ids = await get_tracked_channels(self.db, interaction.guild_id)
-        view = ServerConfigView(self.db, interaction.guild_id, channel_ids)
-        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+        if is_mod(interaction.user):
+            channel_ids = await get_tracked_channels(self.db, interaction.guild_id)
+            view = ServerConfigView(self.db, interaction.guild_id, channel_ids)
+            await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+        else:
+            channel_ids = await get_tracked_channels(self.db, interaction.guild_id)
+            embed = discord.Embed(title="Collectr Scheduled Update Times", color=discord.Color.teal())
+            if not channel_ids:
+                embed.description = "No update channels or times have been configured for this server.\nContact mods to request scheduled updates."
+            else:
+                for cid in channel_ids:
+                    times = await get_update_times(self.db, interaction.guild_id, cid)
+                    if times:
+                        lines = [f"• {tz} — {h:02d}:{m:02d}" for tz, h, m in times]
+                        embed.add_field(name=f"Channel <#{cid}>", value="\n".join(lines), inline=False)
+                    else:
+                        embed.add_field(name=f"Channel <#{cid}>", value="No scheduled times.", inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @collectr_config_cmd.error
     async def collectr_config_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
-        if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "You need **Manage Server** permission to use this command.", ephemeral=True
-            )
-        else:
-            log.exception("Unhandled error in collectr-config", exc_info=error)
-            await interaction.response.send_message("Something went wrong.", ephemeral=True)
+        log.exception("Unhandled error in collectr-config", exc_info=error)
+        await interaction.response.send_message("Something went wrong.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
